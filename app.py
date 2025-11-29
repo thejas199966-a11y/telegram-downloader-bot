@@ -5,7 +5,7 @@ from telethon.tl.types import DocumentAttributeVideo
 import os
 import asyncio
 import uuid
-import gc  # Garbage Collector
+import gc
 
 # Metadata extraction
 from hachoir.metadata import extractMetadata
@@ -43,7 +43,6 @@ def get_video_attributes(file_path):
         print(f"Metadata error: {e}")
         return None
     finally:
-        # CRITICAL: Close the parser to free up RAM immediately
         if parser:
             parser.close()
 # -----------------------------------------------
@@ -68,7 +67,7 @@ async def download_and_send(link, chat_id):
             if not message or not message.media:
                 return "Error: No media found."
 
-            # 3. Download (Stream to disk)
+            # 3. Download to disk
             path = f"/tmp/{uuid.uuid4()}.mp4"
             print(f"Downloading to {path}...")
             await client.download_media(message, file=path)
@@ -78,19 +77,20 @@ async def download_and_send(link, chat_id):
             video_attr = get_video_attributes(path)
             attrs = [video_attr] if video_attr else []
 
-            # Clean RAM before upload
+            # Force clean RAM
             gc.collect()
 
             # 5. UPLOAD (The RAM Fix)
-            # We use upload_file() with connection_count=1 to prevent memory spikes
-            print(f"Uploading file safely to Telegram servers...")
+            print(f"Uploading safely (512KB chunks)...")
+            
+            # We use upload_file with a small part_size_kb to keep RAM usage low.
+            # This replaces the need for 'connection_count'.
             uploaded_file = await client.upload_file(
                 path, 
-                part_size_kb=512, 
-                connection_count=1 
+                part_size_kb=512
             )
 
-            # 6. SEND the uploaded file reference
+            # 6. SEND the file reference
             print(f"Sending to chat {chat_id}...")
             await client.send_file(
                 chat_id, 
@@ -103,7 +103,7 @@ async def download_and_send(link, chat_id):
             return "Success"
 
         except Exception as e:
-            print(f"Crash: {e}")
+            print(f"Error: {e}")
             return f"Error: {str(e)}"
             
         finally:
