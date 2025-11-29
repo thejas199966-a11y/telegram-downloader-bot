@@ -2,3 +2,4 @@ flask
 telethon
 gunicorn
 cryptg
+hachoir
