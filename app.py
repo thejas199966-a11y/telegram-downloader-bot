@@ -5,8 +5,9 @@ from telethon.tl.types import DocumentAttributeVideo
 import os
 import asyncio
 import uuid
+import gc  # Garbage Collector
 
-# New libraries for metadata extraction
+# Metadata extraction
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
@@ -17,8 +18,9 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 SESSION_STR = os.environ.get("SESSION_STR")
 
-# --- HELPER FUNCTION TO FIX ASPECT RATIO ---
+# --- HELPER: Memory-Safe Metadata Extraction ---
 def get_video_attributes(file_path):
+    parser = None
     try:
         parser = createParser(file_path)
         if not parser:
@@ -27,20 +29,10 @@ def get_video_attributes(file_path):
         if not metadata:
             return None
             
-        # Extract details
-        duration = 0
-        if metadata.has("duration"):
-            duration = metadata.get("duration").seconds
-            
-        width = 0
-        if metadata.has("width"):
-            width = metadata.get("width")
-            
-        height = 0
-        if metadata.has("height"):
-            height = metadata.get("height")
+        duration = metadata.get("duration").seconds if metadata.has("duration") else 0
+        width = metadata.get("width") if metadata.has("width") else 0
+        height = metadata.get("height") if metadata.has("height") else 0
 
-        # Create the Telegram attribute that defines the ratio
         return DocumentAttributeVideo(
             duration=duration,
             w=width,
@@ -48,9 +40,13 @@ def get_video_attributes(file_path):
             supports_streaming=True
         )
     except Exception as e:
-        print(f"Metadata extraction failed: {e}")
+        print(f"Metadata error: {e}")
         return None
-# -------------------------------------------
+    finally:
+        # CRITICAL: Close the parser to free up RAM immediately
+        if parser:
+            parser.close()
+# -----------------------------------------------
 
 async def download_and_send(link, chat_id):
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
@@ -69,42 +65,52 @@ async def download_and_send(link, chat_id):
 
             # 2. Get Message
             message = await client.get_messages(entity, ids=msg_id)
-            
             if not message or not message.media:
                 return "Error: No media found."
 
-            # 3. Download
-            filename = f"/tmp/{uuid.uuid4()}.mp4"
-            print(f"Downloading to {filename}...")
-            path = await client.download_media(message, file=filename)
+            # 3. Download (Stream to disk)
+            path = f"/tmp/{uuid.uuid4()}.mp4"
+            print(f"Downloading to {path}...")
+            await client.download_media(message, file=path)
             
-            # 4. Extract Metadata (The Fix)
+            # 4. Extract Metadata
             print("Extracting metadata...")
-            video_attributes = get_video_attributes(path)
-            
-            attrs = []
-            if video_attributes:
-                attrs.append(video_attributes)
+            video_attr = get_video_attributes(path)
+            attrs = [video_attr] if video_attr else []
 
-            # 5. Upload with Attributes
-            print(f"Uploading to {chat_id}...")
+            # Clean RAM before upload
+            gc.collect()
+
+            # 5. UPLOAD (The RAM Fix)
+            # We use upload_file() with connection_count=1 to prevent memory spikes
+            print(f"Uploading file safely to Telegram servers...")
+            uploaded_file = await client.upload_file(
+                path, 
+                part_size_kb=512, 
+                connection_count=1 
+            )
+
+            # 6. SEND the uploaded file reference
+            print(f"Sending to chat {chat_id}...")
             await client.send_file(
                 chat_id, 
-                path, 
+                uploaded_file, 
                 caption="Here is your video 🎥",
-                attributes=attrs, # <--- This fixes the ratio
+                attributes=attrs,
                 supports_streaming=True
             )
             
             return "Success"
 
         except Exception as e:
+            print(f"Crash: {e}")
             return f"Error: {str(e)}"
             
         finally:
-            # 6. Cleanup
+            # 7. Cleanup
             if path and os.path.exists(path):
                 os.remove(path)
+            gc.collect()
 
 @app.route('/download', methods=['POST'])
 def handle_download():
