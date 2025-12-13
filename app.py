@@ -127,36 +127,46 @@ def handle_download():
     
     return {"status": result}
 
-# --- NEW ROUTE: TRUECALLER SEARCH ---
+# --- UPDATED ROUTE: TRUECALLER SEARCH (FIXED ASYNC ISSUE) ---
 @app.route('/api/truecaller', methods=['GET'])
 def truecaller_search():
-    # 1. Get Phone Number from URL parameters
+    # 1. Get Phone Number
     phone_number = request.args.get('phone')
     
-    # 2. Basic Validation
     if not phone_number:
         return jsonify({"error": "Please provide a phone number"}), 400
 
-    # 3. Get Installation ID from Environment Variable
+    # 2. Get Installation ID
     installation_id = os.environ.get("TRUECALLER_INSTALLATION_ID")
     
     if not installation_id:
         return jsonify({"error": "Server misconfiguration: Missing Installation ID"}), 500
 
     try:
-        # 4. Perform the Search
-        # We default to "IN" (India) if no country code is provided in the logic
-        result = search_phonenumber(phone_number, "IN", installation_id)
+        # 3. CREATE ASYNC LOOP (Crucial Fix)
+        # The library returns a coroutine, so we must await it using a loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        # The library returns a JSON string, so we parse it to a dict
+        # Run the async function synchronously
+        result = loop.run_until_complete(search_phonenumber(phone_number, "IN", installation_id))
+        
+        # Close loop to free memory
+        loop.close()
+        
+        # 4. Parse Result
+        # The library might return a JSON string or a Dict. We handle both.
         if isinstance(result, str):
-            result = json.loads(result)
+            try:
+                result = json.loads(result)
+            except:
+                pass # It's already an object or a plain string
             
         return jsonify(result)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-# ------------------------------------
+        return jsonify({"error": f"Search failed: {str(e)}"}), 500
+# ------------------------------------------------------------
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
