@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
@@ -6,6 +6,10 @@ import os
 import asyncio
 import uuid
 import gc
+import json
+
+# --- NEW IMPORT FOR TRUECALLER ---
+from truecallerpy import search_phonenumber
 
 # Metadata extraction
 from hachoir.metadata import extractMetadata
@@ -84,7 +88,6 @@ async def download_and_send(link, chat_id):
             print(f"Uploading safely (512KB chunks)...")
             
             # We use upload_file with a small part_size_kb to keep RAM usage low.
-            # This replaces the need for 'connection_count'.
             uploaded_file = await client.upload_file(
                 path, 
                 part_size_kb=512
@@ -123,6 +126,37 @@ def handle_download():
     result = loop.run_until_complete(download_and_send(link, chat_id))
     
     return {"status": result}
+
+# --- NEW ROUTE: TRUECALLER SEARCH ---
+@app.route('/api/truecaller', methods=['GET'])
+def truecaller_search():
+    # 1. Get Phone Number from URL parameters
+    phone_number = request.args.get('phone')
+    
+    # 2. Basic Validation
+    if not phone_number:
+        return jsonify({"error": "Please provide a phone number"}), 400
+
+    # 3. Get Installation ID from Environment Variable
+    installation_id = os.environ.get("TRUECALLER_INSTALLATION_ID")
+    
+    if not installation_id:
+        return jsonify({"error": "Server misconfiguration: Missing Installation ID"}), 500
+
+    try:
+        # 4. Perform the Search
+        # We default to "IN" (India) if no country code is provided in the logic
+        result = search_phonenumber(phone_number, "IN", installation_id)
+        
+        # The library returns a JSON string, so we parse it to a dict
+        if isinstance(result, str):
+            result = json.loads(result)
+            
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+# ------------------------------------
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
