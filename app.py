@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify
+
+from flask import Flask, request
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
@@ -6,10 +7,6 @@ import os
 import asyncio
 import uuid
 import gc
-import json
-
-# --- NEW IMPORT FOR TRUECALLER ---
-from truecallerpy import search_phonenumber
 
 # Metadata extraction
 from hachoir.metadata import extractMetadata
@@ -88,6 +85,7 @@ async def download_and_send(link, chat_id):
             print(f"Uploading safely (512KB chunks)...")
             
             # We use upload_file with a small part_size_kb to keep RAM usage low.
+            # This replaces the need for 'connection_count'.
             uploaded_file = await client.upload_file(
                 path, 
                 part_size_kb=512
@@ -126,47 +124,6 @@ def handle_download():
     result = loop.run_until_complete(download_and_send(link, chat_id))
     
     return {"status": result}
-
-# --- UPDATED ROUTE: TRUECALLER SEARCH (FIXED ASYNC ISSUE) ---
-@app.route('/api/truecaller', methods=['GET'])
-def truecaller_search():
-    # 1. Get Phone Number
-    phone_number = request.args.get('phone')
-    
-    if not phone_number:
-        return jsonify({"error": "Please provide a phone number"}), 400
-
-    # 2. Get Installation ID
-    installation_id = os.environ.get("TRUECALLER_INSTALLATION_ID")
-    
-    if not installation_id:
-        return jsonify({"error": "Server misconfiguration: Missing Installation ID"}), 500
-
-    try:
-        # 3. CREATE ASYNC LOOP (Crucial Fix)
-        # The library returns a coroutine, so we must await it using a loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Run the async function synchronously
-        result = loop.run_until_complete(search_phonenumber(phone_number, "IN", installation_id))
-        
-        # Close loop to free memory
-        loop.close()
-        
-        # 4. Parse Result
-        # The library might return a JSON string or a Dict. We handle both.
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except:
-                pass # It's already an object or a plain string
-            
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({"error": f"Search failed: {str(e)}"}), 500
-# ------------------------------------------------------------
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
