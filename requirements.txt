@@ -3,4 +3,3 @@ telethon
 gunicorn
 cryptg
 hachoir
-truecallerpy
