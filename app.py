@@ -109,7 +109,8 @@ async def process_video_task(link, chat_id, task_id):
                 attrs = [video_attr] if video_attr else []
                 gc.collect()
                 
-                uploaded_file = await client.upload_file(path, part_size_kb=2048)
+                # FIXED: part_size_kb set to 512 to satisfy strict API limits
+                uploaded_file = await client.upload_file(path, part_size_kb=512)
 
                 # 6. Send
                 await client.send_file(
@@ -156,8 +157,6 @@ def handle_download():
     # --- 🛡️ CRITICAL SAFETY CHECKS 🛡️ ---
     
     # 1. Check for Bot's own messages (Echo Protection)
-    # If the text starts with specific bot phrases or emojis, IGNORE IT.
-    # This stops the loop even if the text contains a valid link.
     if link.startswith("❌") or "Here is your video" in link or "Processing started" in link:
         print(f"Ignored Bot Echo: {link[:50]}...")
         return jsonify({"status": "ignored", "reason": "Bot message detected"}), 200
