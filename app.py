@@ -1,14 +1,15 @@
 from flask import Flask, request, jsonify
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeVideo
+from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
 import os
 import asyncio
 import uuid
 import gc
 import threading
 import re
-import yt_dlp # Added for Instagram
+import yt_dlp
+from fake_useragent import UserAgent
 
 # Metadata extraction
 from hachoir.metadata import extractMetadata
@@ -21,37 +22,43 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 SESSION_STR = os.environ.get("SESSION_STR")
 
-# Limit concurrent downloads to save 1GB RAM
-MAX_CONCURRENT_JOBS = 2
-job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-
 # --- HELPER: Metadata ---
-def get_video_attributes(file_path):
+def get_file_attributes(file_path):
+    """
+    Extracts video/audio attributes for Telegram.
+    """
     parser = None
     try:
         parser = createParser(file_path)
-        if not parser: return None
+        if not parser: return []
         metadata = extractMetadata(parser)
-        if not metadata: return None
+        if not metadata: return []
         
-        duration = metadata.get("duration").seconds if metadata.has("duration") else 0
-        width = metadata.get("width") if metadata.has("width") else 0
-        height = metadata.get("height") if metadata.has("height") else 0
-
-        return DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)
+        attrs = []
+        if metadata.has("duration"):
+            duration = metadata.get("duration").seconds
+            width = metadata.get("width") if metadata.has("width") else 0
+            height = metadata.get("height") if metadata.has("height") else 0
+            
+            # Add Video Attribute
+            if width > 0:
+                attrs.append(DocumentAttributeVideo(
+                    duration=duration, w=width, h=height, supports_streaming=True
+                ))
+            # Add Audio Attribute (if it looks like audio)
+            else:
+                attrs.append(DocumentAttributeAudio(
+                    duration=duration, title="Downloaded Media"
+                ))
+        return attrs
     except:
-        return None
+        return []
     finally:
         if parser: parser.close()
 
 # --- HELPER: Telegram Link Parser ---
 def parse_link_robust(link):
-    """
-    Parses Telegram link. Returns (entity, msg_id, is_private).
-    Returns NONE if invalid.
-    """
     link = link.strip()
-    
     # 1. Private Links: t.me/c/123456/100
     private_match = re.search(r'/c/(\d+)/(\d+)', link)
     if private_match:
@@ -67,21 +74,32 @@ def parse_link_robust(link):
         if username == 'c': return None 
         msg_id = int(public_match.group(2))
         return username, msg_id, False
-
     return None
 
 # --- HELPER: Instagram Downloader ---
 def download_instagram_video(link, output_path):
     """
-    Downloads video from Instagram using yt-dlp.
+    Downloads media from Instagram using yt-dlp with anti-blocking measures.
     """
-    # yt-dlp options
+    # Generate a random user agent to mimic a real browser
+    ua = UserAgent()
+    random_ua = ua.random
+
     ydl_opts = {
-        'outtmpl': output_path,     # Force specific filename
-        'format': 'best[ext=mp4]/best', # Prefer MP4
-        'quiet': True,              # Don't spam logs
+        'outtmpl': output_path,
+        'format': 'best[ext=mp4]/best', # Prioritize MP4
+        'quiet': True,
         'no_warnings': True,
-        # 'cookiefile': 'cookies.txt' # Uncomment if you ever add cookies for private reels
+        'nocheckcertificate': True,
+        'ignoreerrors': True, # Keep going even if some parts fail
+        
+        # --- ANTI-BLOCKING CONFIGURATION ---
+        'user_agent': random_ua,
+        'referer': 'https://www.instagram.com/',
+        'http_headers': {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Fetch-Mode': 'navigate',
+        }
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -89,91 +107,107 @@ def download_instagram_video(link, output_path):
 
 # --- WORKER: Background Process ---
 async def process_video_task(link, chat_id, task_id):
-    async with job_semaphore:
-        print(f"[{task_id}] Processing: {link}")
-        
-        # Use a fresh client for every thread
-        async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
-            path = f"/tmp/{task_id}.mp4"
+    print(f"[{task_id}] Processing started: {link}")
+    
+    # Use a fresh client session for isolation
+    client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+    
+    path = f"/tmp/{task_id}.mp4" # Default extension, yt-dlp might change it
+    
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+             raise Exception("Client not authorized. Check SESSION_STR.")
+
+        # --- DOWNLOAD PHASE ---
+        if "instagram.com" in link:
+            print(f"[{task_id}] Downloading Instagram media...")
+            # Run sync yt-dlp in a separate thread to not block the asyncio loop
+            await asyncio.to_thread(download_instagram_video, link, path)
+            
+            # Handle case where yt-dlp saves as .mkv or other extension
+            if not os.path.exists(path):
+                # Check for other extensions
+                base_name = f"/tmp/{task_id}"
+                for ext in ['.mkv', '.webm', '.mp4']:
+                    if os.path.exists(base_name + ext):
+                        path = base_name + ext
+                        break
+            
+            if not os.path.exists(path):
+                raise Exception("Download failed. Link might be private or IP blocked.")
+
+        else:
+            # === TELEGRAM PATH ===
+            parsed = parse_link_robust(link)
+            if not parsed:
+                print(f"[{task_id}] Invalid Telegram link.")
+                return
+
+            entity_input, msg_id, is_private = parsed
+            
             try:
-                # --- FORK: Check if Instagram or Telegram ---
+                entity = await client.get_entity(entity_input)
+                message = await client.get_messages(entity, ids=msg_id)
                 
-                if "instagram.com" in link:
-                    # === INSTAGRAM PATH ===
-                    print(f"[{task_id}] Detected Instagram link. Downloading via yt-dlp...")
-                    # Run sync function in this async context (safe because we are in a dedicated thread)
-                    download_instagram_video(link, path)
+                if not message or not message.media:
+                    raise Exception("No media found in this message.")
+
+                print(f"[{task_id}] Downloading Telegram media...")
+                
+                # Download with progress callback (optional, kept simple here)
+                path = await client.download_media(message, file=f"/tmp/{task_id}")
+                if not path:
+                    raise Exception("Download returned no file path.")
                     
-                    if not os.path.exists(path):
-                        raise Exception("Download failed (file not created). Link might be private or invalid.")
-
-                else:
-                    # === TELEGRAM PATH ===
-                    parsed = parse_link_robust(link)
-                    if not parsed:
-                        print(f"[{task_id}] Ignored invalid Telegram link.")
-                        return
-
-                    entity_input, msg_id, is_private = parsed
-                    
-                    # Resolve Entity
-                    try:
-                        entity = await client.get_entity(entity_input)
-                    except Exception as e:
-                        if is_private:
-                            raise Exception("I am not a member of this private chat.")
-                        else:
-                            raise Exception(f"Channel not found: {entity_input}")
-
-                    # Get Message
-                    message = await client.get_messages(entity, ids=msg_id)
-                    if not message or not message.media:
-                        raise Exception("No video found in this message.")
-
-                    # Download
-                    print(f"[{task_id}] Downloading from Telegram...")
-                    await client.download_media(message, file=path)
-
-
-                # === COMMON PATH (Upload & Send) ===
-                
-                # 1. Metadata
-                print(f"[{task_id}] extracting metadata...")
-                video_attr = get_video_attributes(path)
-                attrs = [video_attr] if video_attr else []
-                gc.collect()
-                
-                # 2. Upload (512KB chunk size)
-                print(f"[{task_id}] Uploading...")
-                uploaded_file = await client.upload_file(path, part_size_kb=512)
-
-                # 3. Send
-                await client.send_file(
-                    chat_id, 
-                    uploaded_file, 
-                    caption=f"Here is your video 🎥", 
-                    attributes=attrs,
-                    supports_streaming=True
-                )
-                print(f"[{task_id}] Success.")
-
             except Exception as e:
-                print(f"[{task_id}] FAILED: {e}")
-                error_str = str(e)
-                # Ignore invalid link errors to prevent loops
-                if "invalid link" not in error_str.lower():
-                    try:
-                        await client.send_message(chat_id, f"❌ **Error:** `{error_str}`")
-                    except:
-                        pass
+                if is_private:
+                    raise Exception("Cannot access private chat. Bot must be a member.")
+                raise e
 
-            finally:
-                if os.path.exists(path):
-                    try: os.remove(path)
-                    except: pass
-                gc.collect()
+        # --- UPLOAD PHASE ---
+        print(f"[{task_id}] Extracting metadata for {path}...")
+        attrs = get_file_attributes(path)
+        
+        print(f"[{task_id}] Uploading to Telegram...")
+        
+        # Allow unlimited upload size (Telethon handles chunking)
+        # We use a custom caption
+        await client.send_file(
+            chat_id, 
+            path, 
+            caption=f"Here is your media 📂", 
+            attributes=attrs,
+            force_document=False, # Let Telegram decide (video vs file)
+            supports_streaming=True
+        )
+        print(f"[{task_id}] Task Completed.")
+
+    except Exception as e:
+        print(f"[{task_id}] FAILED: {e}")
+        try:
+            await client.send_message(chat_id, f"❌ **Error:** `{str(e)}`")
+        except:
+            pass
+
+    finally:
+        # Cleanup
+        await client.disconnect()
+        if os.path.exists(path):
+            try: os.remove(path)
+            except: pass
+        # Clean up possible variations
+        try:
+            for f in os.listdir("/tmp"):
+                if f.startswith(task_id):
+                    os.remove(os.path.join("/tmp", f))
+        except: pass
+        gc.collect()
 
 def run_async_background(link, chat_id, task_id):
+    """
+    Thread entry point. Creates a new event loop for this thread.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -188,23 +222,23 @@ def handle_download():
     link = data.get('link', '').strip()
     chat_id = data.get('chat_id')
     
-    # --- SAFETY CHECKS ---
-    
-    # 1. Check for Bot Echoes
-    if link.startswith("❌") or "Here is your video" in link:
-        return jsonify({"status": "ignored", "reason": "Bot message detected"}), 200
+    # 1. Filter junk
+    if not link or "Here is your media" in link or link.startswith("❌"):
+        return jsonify({"status": "ignored"}), 200
 
-    # 2. Check for Valid Domain (Telegram OR Instagram)
+    # 2. Validation
     is_telegram = "t.me" in link
     is_instagram = "instagram.com" in link
     
-    if not link or (not is_telegram and not is_instagram):
-        print(f"Ignored unsupported input: {link[:50]}...")
-        return jsonify({"status": "ignored", "reason": "Not a Telegram or Instagram link"}), 200
+    if not (is_telegram or is_instagram):
+        return jsonify({"status": "ignored", "reason": "Unsupported link"}), 200
 
-    # --- END SAFETY CHECKS ---
-
+    # 3. Queue Task
     task_id = str(uuid.uuid4())
+    print(f"[{task_id}] Queued: {link}")
+    
+    # Daemon thread ensures it doesn't block Flask shutdown if needed, 
+    # but for Render web services, it keeps running until the request times out or finishes.
     t = threading.Thread(target=run_async_background, args=(link, chat_id, task_id))
     t.start()
     
