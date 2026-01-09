@@ -2,7 +2,6 @@ import os
 import asyncio
 import uuid
 import gc
-import threading
 import re
 import logging
 import traceback
@@ -32,7 +31,6 @@ SESSION_STR = os.environ.get("SESSION_STR", "")
 
 # --- SAFETY HELPER: File Deletion ---
 def safe_delete(path):
-    """Safely deletes a file without throwing errors."""
     try:
         if path and os.path.exists(path):
             os.remove(path)
@@ -42,7 +40,6 @@ def safe_delete(path):
 
 # --- SAFETY HELPER: Send Error ---
 async def send_error_to_user(client, chat_id, message):
-    """Safely sends an error message to the user."""
     try:
         if client and client.is_connected():
             await client.send_message(chat_id, f"⚠️ **Task Failed**\nReason: {message}")
@@ -51,7 +48,6 @@ async def send_error_to_user(client, chat_id, message):
 
 # --- HELPER: Metadata ---
 def get_file_attributes(file_path):
-    """Extracts attributes (Duration, Width, Height) safely."""
     parser = None
     try:
         parser = createParser(file_path)
@@ -75,16 +71,12 @@ def get_file_attributes(file_path):
                 ))
         return attrs
     except Exception:
-        # If metadata fails, we return empty list. We do NOT stop the process.
         return []
     finally:
         if parser: parser.close()
 
 # --- HELPER: Instagram Downloader ---
 def download_instagram_video(link, output_path):
-    """
-    Downloads from Instagram. Returns True if file exists, False otherwise.
-    """
     try:
         ua = UserAgent()
         random_ua = ua.random
@@ -95,7 +87,7 @@ def download_instagram_video(link, output_path):
             'format': 'best[ext=mp4]/best',
             'quiet': True,
             'no_warnings': True,
-            'ignoreerrors': True, # CRITICAL: Don't crash on minor warnings
+            'ignoreerrors': True,
             'nocheckcertificate': True,
             'user_agent': random_ua,
             'http_headers': {
@@ -107,10 +99,9 @@ def download_instagram_video(link, output_path):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([link])
             
-        # Verify file existence (yt-dlp might append extensions)
         if os.path.exists(output_path): return output_path
         
-        # Check variations (.mkv, .webm)
+        # Check variations
         base = output_path.rsplit('.', 1)[0]
         for ext in ['.mp4', '.mkv', '.webm']:
             if os.path.exists(base + ext):
@@ -121,86 +112,59 @@ def download_instagram_video(link, output_path):
         logger.error(f"Instagram Download Error: {e}")
         return None
 
-# --- WORKER: Main Logic ---
+# --- WORKER: Main Logic (Returns Result Dict) ---
 async def process_task(link, chat_id, task_id):
     logger.info(f"[{task_id}] Processing: {link}")
     client = None
     file_path = f"/tmp/{task_id}.mp4"
     final_path = None
+    result = {"status": "failed", "message": "Unknown error"}
 
     try:
         # 1. Initialize Client
-        try:
-            client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-            await client.connect()
-            if not await client.is_user_authorized():
-                logger.error("Session Invalid")
-                # We can't even tell the user because we aren't authorized
-                return 
-        except Exception as e:
-            logger.critical(f"[{task_id}] Telethon Connection Failed: {e}")
-            return # Stop if we can't connect
+        client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            return {"status": "error", "message": "Bot unauthorized (Check SESSION_STR)"}
 
         # 2. Download Phase
         if "instagram.com" in link:
-            logger.info(f"[{task_id}] Type: Instagram")
-            # Run blocking code in thread
             final_path = await asyncio.to_thread(download_instagram_video, link, file_path)
-            
             if not final_path:
-                await send_error_to_user(client, chat_id, "Instagram download failed. Content might be private or server IP is blocked.")
-                return
+                msg = "Instagram download failed (Private/Blocked)."
+                await send_error_to_user(client, chat_id, msg)
+                return {"status": "error", "message": msg}
 
         elif "t.me" in link:
-            logger.info(f"[{task_id}] Type: Telegram")
-            
-            # Link Parsing
             try:
-                if "/c/" in link: # Private
-                    # Regex: t.me/c/CHANNEL_ID/MSG_ID
+                if "/c/" in link: 
                     match = re.search(r'/c/(\d+)/(\d+)', link)
-                    if not match: raise ValueError("Invalid Private Link format")
-                    cid = int("-100" + match.group(1))
+                    if not match: raise ValueError("Invalid Link")
+                    entity = await client.get_entity(int("-100" + match.group(1)))
                     mid = int(match.group(2))
-                    entity = await client.get_entity(cid)
-                else: # Public
-                    # Regex: t.me/USERNAME/MSG_ID
+                else: 
                     match = re.search(r't\.me/([^/]+)/(\d+)', link)
-                    if not match: raise ValueError("Invalid Public Link format")
-                    user = match.group(1)
+                    if not match: raise ValueError("Invalid Link")
+                    entity = await client.get_entity(match.group(1))
                     mid = int(match.group(2))
-                    entity = await client.get_entity(user)
                 
                 message = await client.get_messages(entity, ids=mid)
-                
                 if not message or not message.media:
-                    await send_error_to_user(client, chat_id, "No media found in that message.")
-                    return
+                    msg = "No media found in message."
+                    await send_error_to_user(client, chat_id, msg)
+                    return {"status": "error", "message": msg}
 
                 final_path = await client.download_media(message, file=file_path)
-                if not final_path:
-                    raise Exception("Download completed but file is missing.")
-
-            except ValueError as ve:
-                await send_error_to_user(client, chat_id, "Invalid Link Format.")
-                return
-            except errors.rpcerrorlist.ChannelPrivateError:
-                await send_error_to_user(client, chat_id, "I cannot access this private channel. Make sure I am a member.")
-                return
             except Exception as e:
-                await send_error_to_user(client, chat_id, f"Telegram Download Error: {str(e)}")
-                return
-        
+                msg = f"Telegram error: {str(e)}"
+                await send_error_to_user(client, chat_id, msg)
+                return {"status": "error", "message": msg}
         else:
-            await send_error_to_user(client, chat_id, "Unsupported Link.")
-            return
+            return {"status": "error", "message": "Unsupported link type"}
 
         # 3. Upload Phase
         try:
-            logger.info(f"[{task_id}] Extracting metadata...")
             attrs = get_file_attributes(final_path)
-
-            logger.info(f"[{task_id}] Uploading to Telegram...")
             await client.send_file(
                 chat_id,
                 final_path,
@@ -209,37 +173,33 @@ async def process_task(link, chat_id, task_id):
                 supports_streaming=True,
                 force_document=False
             )
-            logger.info(f"[{task_id}] Success!")
-
-        except errors.rpcerrorlist.EntityTooLargeError:
-            await send_error_to_user(client, chat_id, "File is too large for Telegram API (Limit is 2GB).")
+            result = {"status": "success", "message": "Media sent successfully"}
         except Exception as e:
-            await send_error_to_user(client, chat_id, f"Upload Failed: {str(e)}")
+            msg = f"Upload failed: {str(e)}"
+            await send_error_to_user(client, chat_id, msg)
+            result = {"status": "error", "message": msg}
 
     except Exception as e:
-        # Catch-all for unforeseen crashes
-        logger.critical(f"[{task_id}] CRITICAL FAILURE: {traceback.format_exc()}")
+        logger.critical(f"[{task_id}] CRITICAL: {traceback.format_exc()}")
         if client and client.is_connected():
-            await send_error_to_user(client, chat_id, "Internal Server Error.")
+            await send_error_to_user(client, chat_id, "Internal Server Error")
+        result = {"status": "error", "message": str(e)}
 
     finally:
-        # 4. Cleanup Phase
-        if client:
-            await client.disconnect()
-        
+        if client: await client.disconnect()
         if final_path: safe_delete(final_path)
-        safe_delete(file_path) # Clean initial path just in case
+        safe_delete(file_path)
         gc.collect()
 
-# --- THREAD WRAPPER ---
-def run_background_loop(link, chat_id, task_id):
-    """Creates a fresh asyncio loop for the thread."""
+    return result
+
+# --- SYNC WRAPPER ---
+def run_sync_process(link, chat_id, task_id):
+    """Runs the async task in a blocking manner."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(process_task(link, chat_id, task_id))
-    except Exception as e:
-        logger.error(f"Thread loop crashed: {e}")
+        return loop.run_until_complete(process_task(link, chat_id, task_id))
     finally:
         loop.close()
 
@@ -249,14 +209,14 @@ def handle_download():
     try:
         data = request.json
         if not data:
-            return jsonify({"status": "error", "reason": "No JSON data"}), 400
+            return jsonify({"status": "error", "message": "No JSON data"}), 400
 
         link = data.get('link', '').strip()
         chat_id = data.get('chat_id')
 
         # Basic Validation
         if not link or not chat_id:
-            return jsonify({"status": "ignored", "reason": "Missing link or chat_id"}), 200
+            return jsonify({"status": "error", "message": "Missing link or chat_id"}), 400
         
         # Filter Bot Echoes
         if "Here is your media" in link or link.startswith("⚠️"):
@@ -264,15 +224,16 @@ def handle_download():
 
         task_id = str(uuid.uuid4())
         
-        # Start Background Thread
-        t = threading.Thread(target=run_background_loop, args=(link, chat_id, task_id))
-        t.start()
+        # BLOCKING CALL - The API will wait here until process finishes
+        result = run_sync_process(link, chat_id, task_id)
         
-        return jsonify({"status": "queued", "task_id": task_id}), 200
+        # Return the actual result from the process
+        status_code = 200 if result['status'] == 'success' else 500
+        return jsonify(result), status_code
 
     except Exception as e:
         logger.error(f"API Route Error: {e}")
-        return jsonify({"status": "error", "reason": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def health_check():
