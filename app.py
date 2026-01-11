@@ -5,6 +5,7 @@ import gc
 import re
 import logging
 import traceback
+import concurrent.futures
 from flask import Flask, request, jsonify
 
 # Telegram Imports
@@ -28,6 +29,10 @@ app = Flask(__name__)
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STR = os.environ.get("SESSION_STR", "")
+
+# --- THREAD POOL (Background Worker) ---
+# strictly set to 1 worker to prevent RAM explosion on Render Free Tier
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # --- SAFETY HELPER: File Deletion ---
 def safe_delete(path):
@@ -90,6 +95,7 @@ def download_instagram_video(link, output_path):
             'ignoreerrors': True,
             'nocheckcertificate': True,
             'user_agent': random_ua,
+            'socket_timeout': 15,  # FIX: Prevent hanging indefinitely
             'http_headers': {
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Sec-Fetch-Mode': 'navigate',
@@ -112,35 +118,38 @@ def download_instagram_video(link, output_path):
         logger.error(f"Instagram Download Error: {e}")
         return None
 
-# --- WORKER: Main Logic (Returns Result Dict) ---
-async def process_task(link, chat_id, task_id):
-    logger.info(f"[{task_id}] Processing: {link}")
+# --- ASYNC WORKER LOGIC ---
+async def process_task_async(link, chat_id, task_id):
+    """The actual heavy lifting logic."""
+    logger.info(f"[{task_id}] Processing Started: {link}")
     client = None
     file_path = f"/tmp/{task_id}.mp4"
     final_path = None
-    result = {"status": "failed", "message": "Unknown error"}
 
     try:
-        # 1. Initialize Client
+        # 1. Initialize Client (Per-task isolation for thread safety)
         client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
         await client.connect()
+        
         if not await client.is_user_authorized():
-            return {"status": "error", "message": "Bot unauthorized (Check SESSION_STR)"}
+            logger.error(f"[{task_id}] Bot Unauthorized")
+            return
 
         # 2. Download Phase
         if "instagram.com" in link:
             final_path = await asyncio.to_thread(download_instagram_video, link, file_path)
             if not final_path:
-                msg = "Instagram download failed (Private/Blocked)."
-                await send_error_to_user(client, chat_id, msg)
-                return {"status": "error", "message": msg}
+                await send_error_to_user(client, chat_id, "Instagram download failed (Private/Blocked).")
+                return
 
         elif "t.me" in link:
             try:
                 if "/c/" in link: 
                     match = re.search(r'/c/(\d+)/(\d+)', link)
                     if not match: raise ValueError("Invalid Link")
-                    entity = await client.get_entity(int("-100" + match.group(1)))
+                    # Fix: Handle private channel ID correctly
+                    cid = int("-100" + match.group(1))
+                    entity = await client.get_entity(cid)
                     mid = int(match.group(2))
                 else: 
                     match = re.search(r't\.me/([^/]+)/(\d+)', link)
@@ -150,21 +159,23 @@ async def process_task(link, chat_id, task_id):
                 
                 message = await client.get_messages(entity, ids=mid)
                 if not message or not message.media:
-                    msg = "No media found in message."
-                    await send_error_to_user(client, chat_id, msg)
-                    return {"status": "error", "message": msg}
+                    await send_error_to_user(client, chat_id, "No media found in message.")
+                    return
 
                 final_path = await client.download_media(message, file=file_path)
             except Exception as e:
-                msg = f"Telegram error: {str(e)}"
-                await send_error_to_user(client, chat_id, msg)
-                return {"status": "error", "message": msg}
+                await send_error_to_user(client, chat_id, f"Telegram error: {str(e)}")
+                return
         else:
-            return {"status": "error", "message": "Unsupported link type"}
+            await send_error_to_user(client, chat_id, "Unsupported link type")
+            return
 
         # 3. Upload Phase
         try:
+            logger.info(f"[{task_id}] Uploading...")
             attrs = get_file_attributes(final_path)
+            
+            # Send file logic
             await client.send_file(
                 chat_id,
                 final_path,
@@ -173,17 +184,15 @@ async def process_task(link, chat_id, task_id):
                 supports_streaming=True,
                 force_document=False
             )
-            result = {"status": "success", "message": "Media sent successfully"}
+            logger.info(f"[{task_id}] Success")
         except Exception as e:
-            msg = f"Upload failed: {str(e)}"
-            await send_error_to_user(client, chat_id, msg)
-            result = {"status": "error", "message": msg}
+            logger.error(f"[{task_id}] Upload Failed: {e}")
+            await send_error_to_user(client, chat_id, f"Upload failed: {str(e)}")
 
     except Exception as e:
-        logger.critical(f"[{task_id}] CRITICAL: {traceback.format_exc()}")
+        logger.critical(f"[{task_id}] CRITICAL FAIL: {traceback.format_exc()}")
         if client and client.is_connected():
             await send_error_to_user(client, chat_id, "Internal Server Error")
-        result = {"status": "error", "message": str(e)}
 
     finally:
         if client: await client.disconnect()
@@ -191,15 +200,18 @@ async def process_task(link, chat_id, task_id):
         safe_delete(file_path)
         gc.collect()
 
-    return result
-
-# --- SYNC WRAPPER ---
-def run_sync_process(link, chat_id, task_id):
-    """Runs the async task in a blocking manner."""
+# --- THREAD WRAPPER ---
+def run_background_process(link, chat_id, task_id):
+    """
+    Creates a new event loop for this thread and runs the async task.
+    This runs completely independent of the Flask request.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(process_task(link, chat_id, task_id))
+        loop.run_until_complete(process_task_async(link, chat_id, task_id))
+    except Exception as e:
+        logger.error(f"Thread Error: {e}")
     finally:
         loop.close()
 
@@ -224,12 +236,18 @@ def handle_download():
 
         task_id = str(uuid.uuid4())
         
-        # BLOCKING CALL - The API will wait here until process finishes
-        result = run_sync_process(link, chat_id, task_id)
+        # FIX: Fire and Forget!
+        # Submit the task to the thread pool and return IMMEDIATELY.
+        executor.submit(run_background_process, link, chat_id, task_id)
         
-        # Return the actual result from the process
-        status_code = 200 if result['status'] == 'success' else 500
-        return jsonify(result), status_code
+        logger.info(f"[{task_id}] Task Queued for: {link}")
+        
+        # Return success immediately to keep n8n happy
+        return jsonify({
+            "status": "queued", 
+            "message": "Task started in background", 
+            "task_id": task_id
+        }), 200
 
     except Exception as e:
         logger.error(f"API Route Error: {e}")
