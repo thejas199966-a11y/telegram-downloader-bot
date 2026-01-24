@@ -32,10 +32,12 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STR = os.environ.get("SESSION_STR", "")
 
-# RAPID API CONFIG
+# RAPID API CONFIG (Updated based on your screenshot)
+# Note: The host in your image has a "1" at the end: ...generator1.p.rapidapi.com
 RAPID_API_KEY = os.environ.get("RAPID_API_KEY", "") 
-RAPID_API_HOST = os.environ.get("RAPID_API_HOST", "terabox-downloader-direct-download-link-generator.p.rapidapi.com")
-RAPID_API_URL = os.environ.get("RAPID_API_URL", "https://terabox-downloader-direct-download-link-generator.p.rapidapi.com/fetch")
+RAPID_API_HOST = os.environ.get("RAPID_API_HOST", "terabox-downloader-direct-download-link-generator1.p.rapidapi.com")
+# The endpoint in your screenshot is "/url"
+RAPID_API_URL = os.environ.get("RAPID_API_URL", f"https://{RAPID_API_HOST}/url")
 
 # --- GLOBAL STATE ---
 TASK_STORE = {}
@@ -98,29 +100,33 @@ def get_file_attributes(file_path):
     finally:
         if parser: parser.close()
 
-# --- HELPER: Fetch Terabox Data (API) ---
+# --- HELPER: Fetch Terabox Data (Updated for GET Request) ---
 def fetch_terabox_data(link, task_id):
     """
-    Fetches the JSON list from the API.
-    Returns a LIST of file objects: [{'url':..., 'name':...}, ...]
+    Fetches the JSON list from the API using GET method with Query Params.
+    Matches the screenshot structure.
     """
     try:
         headers = {
             "x-rapidapi-key": RAPID_API_KEY,
-            "x-rapidapi-host": RAPID_API_HOST,
-            "Content-Type": "application/json"
+            "x-rapidapi-host": RAPID_API_HOST
         }
-        payload = {"url": link}
         
-        response = requests.post(RAPID_API_URL, json=payload, headers=headers)
+        # CHANGED: Use 'params' for GET request query string (?url=...)
+        querystring = {"url": link}
+        
+        logger.info(f"Fetching Terabox link via GET API: {RAPID_API_URL}")
+        
+        # CHANGED: requests.get instead of post
+        response = requests.get(RAPID_API_URL, headers=headers, params=querystring)
+        
         if response.status_code != 200:
-            logger.error(f"API Error: {response.text}")
+            logger.error(f"API Error ({response.status_code}): {response.text}")
             return None
 
         data = response.json()
         
-        # Normalize response: The user says it ALWAYS returns a list [...]
-        # If for some reason it returns a single dict, wrap it in list
+        # Normalize response (Ensure it's a list)
         if isinstance(data, dict):
             data = [data]
             
@@ -141,10 +147,8 @@ def fetch_terabox_data(link, task_id):
 
 # --- HELPER: Generic File Downloader ---
 def download_file(url, output_path, task_id, current_file_idx, total_files):
-    """
-    Downloads a single file from a URL to output_path.
-    """
     try:
+        # Important: Some Terabox direct links require a Referer header
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
             "Referer": "https://terabox.com/"
@@ -161,11 +165,10 @@ def download_file(url, output_path, task_id, current_file_idx, total_files):
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
-                            # Calculate percentage based on THIS file
                             p = (downloaded / total_size) * 100
-                            # Update global status
                             msg = f"Downloading file {current_file_idx}/{total_files}"
-                            if int(p) % 10 == 0:
+                            # Update status every 5%
+                            if int(p) % 5 == 0:
                                 update_task(task_id, "processing", phase="downloading", progress=p, message=msg)
         return output_path
     except Exception as e:
@@ -174,7 +177,6 @@ def download_file(url, output_path, task_id, current_file_idx, total_files):
 
 # --- HELPER: Instagram Downloader ---
 def download_instagram_video(link, output_path, task_id):
-    # (Kept identical to previous)
     try:
         ua = UserAgent()
         def progress_hook(d):
@@ -206,9 +208,6 @@ async def process_task_async(link, chat_id, task_id):
     
     client = None
     temp_dir = "/tmp"
-    
-    # We will use this list to queue items. 
-    # Structure: [{'type': 'local', 'path': ...}] or [{'type': 'url', 'url': ..., 'name': ...}]
     download_queue = []
 
     try:
@@ -219,7 +218,7 @@ async def process_task_async(link, chat_id, task_id):
             update_task(task_id, "failed", message="Bot Login Failed")
             return
 
-        # 2. Determine Source & Prepare Queue
+        # 2. Determine Source
         if "instagram.com" in link:
             target = f"{temp_dir}/{task_id}.mp4"
             path = await asyncio.to_thread(download_instagram_video, link, target, task_id)
@@ -230,15 +229,14 @@ async def process_task_async(link, chat_id, task_id):
                 return
 
         elif any(x in link for x in ["terabox", "1024tera", "teraboxapp", "momerybox"]):
-            # Get List of Links (Don't download yet)
+            # Get Links via GET API
             files_info = await asyncio.to_thread(fetch_terabox_data, link, task_id)
             if not files_info:
-                msg = "Terabox API returned no files. Link might be dead."
+                msg = "Terabox API returned no files. Check API Key or Link."
                 update_task(task_id, "failed", message=msg)
                 await send_error_to_user(client, chat_id, msg)
                 return
             
-            # Add all items to queue
             for item in files_info:
                 download_queue.append({
                     'type': 'url', 
@@ -247,28 +245,58 @@ async def process_task_async(link, chat_id, task_id):
                 })
 
         elif "t.me" in link:
-            # Telegram logic (Single file usually)
-            # ... (For brevity, skipping detailed Telegram re-download logic here, assuming standard link)
-            pass 
+            # Standard Telegram Logic
+            try:
+                if "/c/" in link: 
+                    match = re.search(r'/c/(\d+)/(\d+)', link)
+                    cid, mid = int("-100" + match.group(1)), int(match.group(2))
+                    entity = await client.get_entity(cid)
+                else: 
+                    match = re.search(r't\.me/([^/]+)/(\d+)', link)
+                    entity = await client.get_entity(match.group(1))
+                    mid = int(match.group(2))
+                
+                message = await client.get_messages(entity, ids=mid)
+                if not message or not message.media:
+                    return
 
-        # 3. PROCESS QUEUE (Download -> Upload -> Delete Loop)
+                # Telegram handles download internally, but we need to track it
+                # For simplicity in this unified queue, we do a direct download here
+                # (You might want to refactor this to fit the queue if needed, 
+                # but standard TG downloads are usually single files)
+                target = f"{temp_dir}/{task_id}.mp4"
+                
+                def telegram_progress(current, total):
+                    p = (current / total) * 100
+                    update_task(task_id, "processing", phase="downloading", progress=p)
+
+                path = await client.download_media(message, file=target, progress_callback=telegram_progress)
+                if path:
+                     download_queue.append({'type': 'local', 'path': path})
+
+            except Exception as e:
+                logger.error(f"TG Error: {e}")
+                return
+
+        # 3. PROCESS QUEUE
         total_files = len(download_queue)
-        
         if total_files == 0:
-            update_task(task_id, "failed", message="No files found to process.")
+            update_task(task_id, "failed", message="No files found.")
             return
 
         for index, item in enumerate(download_queue, start=1):
             current_path = None
             
-            # Step A: Download (if needed)
+            # Step A: Download
             if item['type'] == 'url':
                 update_task(task_id, "processing", phase="downloading", message=f"Downloading {index}/{total_files}")
                 
-                # Sanitize filename
                 clean_name = re.sub(r'[\\/*?:"<>|]', "", item['name'])
+                # Ensure extension matches if missing
+                if not clean_name.endswith(('.mp4', '.mkv', '.webm', '.jpg', '.png')):
+                    clean_name += ".mp4"
+                    
                 temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{clean_name}")
-                
                 current_path = await asyncio.to_thread(download_file, item['url'], temp_path, task_id, index, total_files)
             
             elif item['type'] == 'local':
@@ -276,7 +304,7 @@ async def process_task_async(link, chat_id, task_id):
 
             if not current_path or not os.path.exists(current_path):
                 await send_error_to_user(client, chat_id, f"Failed to download file {index}/{total_files}")
-                continue # Skip to next file in folder
+                continue 
 
             # Step B: Upload
             try:
@@ -285,7 +313,6 @@ async def process_task_async(link, chat_id, task_id):
                 
                 async def upload_progress(current, total):
                     p = (current / total) * 100
-                    # Only update DB every 5%
                     if int(p) % 5 == 0:
                         update_task(task_id, "processing", phase="uploading", progress=p, message=f"Uploading {index}/{total_files}")
 
@@ -299,9 +326,8 @@ async def process_task_async(link, chat_id, task_id):
                 )
             except Exception as e:
                 logger.error(f"Upload Fail: {e}")
-                await send_error_to_user(client, chat_id, f"Error uploading file {index}: {str(e)}")
+                await send_error_to_user(client, chat_id, f"Error uploading file {index}")
             finally:
-                # Step C: DELETE IMMEDIATELY
                 safe_delete(current_path)
 
         update_task(task_id, "completed", phase="done", progress=100, message="All files sent.")
@@ -313,7 +339,7 @@ async def process_task_async(link, chat_id, task_id):
         if client: await client.disconnect()
         gc.collect()
 
-# --- ROUTES & RUNNER (Same as before) ---
+# --- RUNNER ---
 def run_background_process(link, chat_id, task_id):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -322,6 +348,7 @@ def run_background_process(link, chat_id, task_id):
     finally:
         loop.close()
 
+# --- ROUTES ---
 @app.route('/download', methods=['POST'])
 def handle_download():
     try:
