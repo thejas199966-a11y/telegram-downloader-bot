@@ -8,6 +8,7 @@ import traceback
 import concurrent.futures
 import shutil
 import requests
+import json
 from flask import Flask, request, jsonify
 
 # Telegram Imports
@@ -32,11 +33,9 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STR = os.environ.get("SESSION_STR", "")
 
-# RAPID API CONFIG (Updated based on your screenshot)
-# Note: The host in your image has a "1" at the end: ...generator1.p.rapidapi.com
+# RAPID API CONFIG
 RAPID_API_KEY = os.environ.get("RAPID_API_KEY", "") 
 RAPID_API_HOST = os.environ.get("RAPID_API_HOST", "terabox-downloader-direct-download-link-generator1.p.rapidapi.com")
-# The endpoint in your screenshot is "/url"
 RAPID_API_URL = os.environ.get("RAPID_API_URL", f"https://{RAPID_API_HOST}/url")
 
 # --- GLOBAL STATE ---
@@ -63,13 +62,18 @@ def safe_delete(path):
     except Exception:
         pass
 
-# --- HELPER: Send Error to Telegram ---
-async def send_error_to_user(client, chat_id, message):
+# --- HELPER: Send Message to Telegram (User Friendly) ---
+async def send_msg_to_user(client, chat_id, message, is_error=False):
+    """
+    Sends a clean message to the user. 
+    If is_error=True, adds a warning emoji but keeps the text polite.
+    """
     try:
         if client and client.is_connected():
-            await client.send_message(chat_id, f"⚠️ **Task Failed**\n{message}")
-    except Exception:
-        pass
+            prefix = "⚠️ **Oops!**\n" if is_error else "ℹ️ "
+            await client.send_message(chat_id, f"{prefix}{message}")
+    except Exception as e:
+        logger.error(f"Telegram Send Error: {e}")
 
 # --- HELPER: Metadata ---
 def get_file_attributes(file_path):
@@ -100,61 +104,70 @@ def get_file_attributes(file_path):
     finally:
         if parser: parser.close()
 
-# --- HELPER: Fetch Terabox Data (Updated for GET Request) ---
+# --- HELPER: Fetch Terabox Data (API) ---
 def fetch_terabox_data(link, task_id):
     """
-    Fetches the JSON list from the API using GET method with Query Params.
-    Matches the screenshot structure.
+    Fetches data. Returns (list_of_files, error_message_for_log).
+    If success, error_message is None.
     """
     try:
         headers = {
             "x-rapidapi-key": RAPID_API_KEY,
             "x-rapidapi-host": RAPID_API_HOST
         }
-        
-        # CHANGED: Use 'params' for GET request query string (?url=...)
         querystring = {"url": link}
         
-        logger.info(f"Fetching Terabox link via GET API: {RAPID_API_URL}")
+        # Log purely for admin debugging
+        logger.info(f"[{task_id}] API Request: {RAPID_API_URL}")
         
-        # CHANGED: requests.get instead of post
-        response = requests.get(RAPID_API_URL, headers=headers, params=querystring)
+        response = requests.get(RAPID_API_URL, headers=headers, params=querystring, timeout=30)
         
+        if response.status_code == 403:
+            return None, "API Key Invalid or Expired (403)"
+        if response.status_code == 429:
+            return None, "API Rate Limit Exceeded (429)"
         if response.status_code != 200:
-            logger.error(f"API Error ({response.status_code}): {response.text}")
-            return None
+            return None, f"API Error {response.status_code}: {response.text[:100]}"
 
-        data = response.json()
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return None, f"Invalid JSON response: {response.text[:100]}"
         
-        # Normalize response (Ensure it's a list)
+        if not data:
+            return None, "API returned empty data (Link might be dead/private)"
+
+        # Normalize to list
         if isinstance(data, dict):
             data = [data]
             
         file_list = []
         for item in data:
-            # Prioritize 'direct_link', fallback to 'link'
-            d_link = item.get("direct_link") or item.get("link")
-            fname = item.get("file_name", "video.mp4")
+            # Flexible key search
+            d_link = item.get("direct_link") or item.get("link") or item.get("url") or item.get("downloadLink")
+            fname = item.get("file_name") or item.get("filename") or item.get("title") or "video.mp4"
             
             if d_link:
                 file_list.append({"url": d_link, "name": fname})
-                
-        return file_list
+        
+        if not file_list:
+            # If we got JSON but extracted 0 links
+            return None, f"No direct links found in response: {str(data)[:100]}"
+            
+        return file_list, None
 
     except Exception as e:
-        logger.error(f"Terabox Fetch Error: {e}")
-        return None
+        return None, f"Exception during fetch: {str(e)}"
 
 # --- HELPER: Generic File Downloader ---
 def download_file(url, output_path, task_id, current_file_idx, total_files):
     try:
-        # Important: Some Terabox direct links require a Referer header
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
             "Referer": "https://terabox.com/"
         }
         
-        with requests.get(url, stream=True, headers=headers) as r:
+        with requests.get(url, stream=True, headers=headers, timeout=20) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
             downloaded = 0
@@ -166,13 +179,18 @@ def download_file(url, output_path, task_id, current_file_idx, total_files):
                         downloaded += len(chunk)
                         if total_size > 0:
                             p = (downloaded / total_size) * 100
-                            msg = f"Downloading file {current_file_idx}/{total_files}"
-                            # Update status every 5%
-                            if int(p) % 5 == 0:
-                                update_task(task_id, "processing", phase="downloading", progress=p, message=msg)
+                            # Log every 10% internally, don't spam logs
+                            if int(p) % 10 == 0:
+                                update_task(task_id, "processing", phase="downloading", progress=p)
+        
+        # Validation: Check if we downloaded a tiny error file
+        if os.path.getsize(output_path) < 2000:
+             logger.warning(f"[{task_id}] Downloaded file is too small (<2kb). Likely an error page.")
+             return None
+
         return output_path
     except Exception as e:
-        logger.error(f"Download Error: {e}")
+        logger.error(f"[{task_id}] Download Exception: {e}")
         return None
 
 # --- HELPER: Instagram Downloader ---
@@ -216,6 +234,7 @@ async def process_task_async(link, chat_id, task_id):
         await client.connect()
         if not await client.is_user_authorized():
             update_task(task_id, "failed", message="Bot Login Failed")
+            logger.error(f"[{task_id}] Login Failed: Check Session String")
             return
 
         # 2. Determine Source
@@ -225,24 +244,23 @@ async def process_task_async(link, chat_id, task_id):
             if path:
                 download_queue.append({'type': 'local', 'path': path})
             else:
-                await send_error_to_user(client, chat_id, "IG Download Failed")
+                await send_msg_to_user(client, chat_id, "Could not download from Instagram. The post might be private.", is_error=True)
                 return
 
         elif any(x in link for x in ["terabox", "1024tera", "teraboxapp", "momerybox"]):
-            # Get Links via GET API
-            files_info = await asyncio.to_thread(fetch_terabox_data, link, task_id)
-            if not files_info:
-                msg = "Terabox API returned no files. Check API Key or Link."
-                update_task(task_id, "failed", message=msg)
-                await send_error_to_user(client, chat_id, msg)
+            # Use updated fetcher that returns detailed error for LOGS, but polite msg for USER
+            files_info, log_error = await asyncio.to_thread(fetch_terabox_data, link, task_id)
+            
+            if log_error:
+                # Log the real ugly error for you
+                logger.error(f"[{task_id}] Terabox Failure: {log_error}")
+                # Send polite message to user
+                await send_msg_to_user(client, chat_id, "Unable to process this Terabox link. It might be invalid, expired, or server is busy.", is_error=True)
+                update_task(task_id, "failed", message="API Fetch Failed")
                 return
             
             for item in files_info:
-                download_queue.append({
-                    'type': 'url', 
-                    'url': item['url'], 
-                    'name': item['name']
-                })
+                download_queue.append({'type': 'url', 'url': item['url'], 'name': item['name']})
 
         elif "t.me" in link:
             # Standard Telegram Logic
@@ -258,14 +276,10 @@ async def process_task_async(link, chat_id, task_id):
                 
                 message = await client.get_messages(entity, ids=mid)
                 if not message or not message.media:
+                    await send_msg_to_user(client, chat_id, "No media found in that Telegram link.", is_error=True)
                     return
 
-                # Telegram handles download internally, but we need to track it
-                # For simplicity in this unified queue, we do a direct download here
-                # (You might want to refactor this to fit the queue if needed, 
-                # but standard TG downloads are usually single files)
                 target = f"{temp_dir}/{task_id}.mp4"
-                
                 def telegram_progress(current, total):
                     p = (current / total) * 100
                     update_task(task_id, "processing", phase="downloading", progress=p)
@@ -275,14 +289,20 @@ async def process_task_async(link, chat_id, task_id):
                      download_queue.append({'type': 'local', 'path': path})
 
             except Exception as e:
-                logger.error(f"TG Error: {e}")
+                logger.error(f"[{task_id}] Telegram Fetch Error: {e}")
+                await send_msg_to_user(client, chat_id, "Could not access that Telegram message. Ensure the bot is in the channel.", is_error=True)
                 return
 
         # 3. PROCESS QUEUE
         total_files = len(download_queue)
+        
         if total_files == 0:
-            update_task(task_id, "failed", message="No files found.")
+            await send_msg_to_user(client, chat_id, "No downloadable files found.", is_error=True)
             return
+
+        # Notify user processing started
+        if total_files > 1:
+            await send_msg_to_user(client, chat_id, f"Found {total_files} files. Downloading one by one...")
 
         for index, item in enumerate(download_queue, start=1):
             current_path = None
@@ -292,10 +312,9 @@ async def process_task_async(link, chat_id, task_id):
                 update_task(task_id, "processing", phase="downloading", message=f"Downloading {index}/{total_files}")
                 
                 clean_name = re.sub(r'[\\/*?:"<>|]', "", item['name'])
-                # Ensure extension matches if missing
                 if not clean_name.endswith(('.mp4', '.mkv', '.webm', '.jpg', '.png')):
                     clean_name += ".mp4"
-                    
+                
                 temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{clean_name}")
                 current_path = await asyncio.to_thread(download_file, item['url'], temp_path, task_id, index, total_files)
             
@@ -303,7 +322,9 @@ async def process_task_async(link, chat_id, task_id):
                 current_path = item['path']
 
             if not current_path or not os.path.exists(current_path):
-                await send_error_to_user(client, chat_id, f"Failed to download file {index}/{total_files}")
+                # Silent fail for the user on specific file, but log it
+                logger.error(f"[{task_id}] Failed to download item {index}")
+                await send_msg_to_user(client, chat_id, f"Skipped file {index}: Download failed.", is_error=True)
                 continue 
 
             # Step B: Upload
@@ -314,27 +335,28 @@ async def process_task_async(link, chat_id, task_id):
                 async def upload_progress(current, total):
                     p = (current / total) * 100
                     if int(p) % 5 == 0:
-                        update_task(task_id, "processing", phase="uploading", progress=p, message=f"Uploading {index}/{total_files}")
+                        update_task(task_id, "processing", phase="uploading", progress=p)
 
                 await client.send_file(
                     chat_id,
                     current_path,
-                    caption=f"📁 File {index}/{total_files}",
+                    caption=f"📁 **File {index}/{total_files}**",
                     attributes=attrs,
                     supports_streaming=True,
                     progress_callback=upload_progress
                 )
             except Exception as e:
-                logger.error(f"Upload Fail: {e}")
-                await send_error_to_user(client, chat_id, f"Error uploading file {index}")
+                logger.error(f"[{task_id}] Upload Fail: {e}")
+                await send_msg_to_user(client, chat_id, f"Failed to upload file {index} to Telegram.", is_error=True)
             finally:
                 safe_delete(current_path)
 
         update_task(task_id, "completed", phase="done", progress=100, message="All files sent.")
 
     except Exception as e:
-        logger.error(traceback.format_exc())
+        logger.error(f"[{task_id}] Critical Error: {traceback.format_exc()}")
         update_task(task_id, "failed", message="Internal Server Error")
+        await send_msg_to_user(client, chat_id, "An internal error occurred. Please try again later.", is_error=True)
     finally:
         if client: await client.disconnect()
         gc.collect()
