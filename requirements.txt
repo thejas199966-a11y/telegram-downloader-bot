@@ -5,3 +5,4 @@ cryptg
 hachoir
 yt-dlp
 fake-useragent
+requests
