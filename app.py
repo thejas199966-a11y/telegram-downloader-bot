@@ -312,7 +312,9 @@ async def process_task_async(link, chat_id, task_id):
                 update_task(task_id, "processing", phase="downloading", message=f"Downloading {index}/{total_files}")
                 
                 clean_name = re.sub(r'[\\/*?:"<>|]', "", item['name'])
-                if not clean_name.endswith(('.mp4', '.mkv', '.webm', '.jpg', '.png')):
+                
+                # FIX: Added image extensions to this check so they aren't forced to .mp4
+                if not clean_name.lower().endswith(('.mp4', '.mkv', '.webm', '.jpg', '.png', '.jpeg', '.webp', '.bmp', '.gif')):
                     clean_name += ".mp4"
                 
                 temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{clean_name}")
@@ -330,7 +332,17 @@ async def process_task_async(link, chat_id, task_id):
             # Step B: Upload
             try:
                 update_task(task_id, "processing", phase="uploading", message=f"Uploading {index}/{total_files}")
-                attrs = get_file_attributes(current_path)
+                
+                # FIX: Check if it is an image or video to determine attributes and streaming support
+                is_video_file = current_path.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv'))
+                
+                if is_video_file:
+                    attrs = get_file_attributes(current_path)
+                    use_streaming = True
+                else:
+                    # It is an image/photo
+                    attrs = []
+                    use_streaming = False
                 
                 async def upload_progress(current, total):
                     p = (current / total) * 100
@@ -342,7 +354,7 @@ async def process_task_async(link, chat_id, task_id):
                     current_path,
                     caption=f"📁 **File {index}/{total_files}**",
                     attributes=attrs,
-                    supports_streaming=True,
+                    supports_streaming=use_streaming,
                     progress_callback=upload_progress
                 )
             except Exception as e:
