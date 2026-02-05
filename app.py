@@ -279,7 +279,12 @@ async def process_task_async(link, chat_id, task_id):
                     await send_msg_to_user(client, chat_id, "No media found in that Telegram link.", is_error=True)
                     return
 
-                target = f"{temp_dir}/{task_id}.mp4"
+                # --- FIX START: Detect extension from message instead of hardcoding .mp4 ---
+                # message.file.ext returns the extension (e.g., '.jpg') automatically
+                file_ext = message.file.ext if message.file else ".mp4"
+                target = f"{temp_dir}/{task_id}{file_ext}"
+                # --- FIX END ---
+
                 def telegram_progress(current, total):
                     p = (current / total) * 100
                     update_task(task_id, "processing", phase="downloading", progress=p)
@@ -313,7 +318,7 @@ async def process_task_async(link, chat_id, task_id):
                 
                 clean_name = re.sub(r'[\\/*?:"<>|]', "", item['name'])
                 
-                # FIX: Added image extensions to this check so they aren't forced to .mp4
+                # Check for image extensions to avoid forced .mp4 conversion
                 if not clean_name.lower().endswith(('.mp4', '.mkv', '.webm', '.jpg', '.png', '.jpeg', '.webp', '.bmp', '.gif')):
                     clean_name += ".mp4"
                 
@@ -324,7 +329,6 @@ async def process_task_async(link, chat_id, task_id):
                 current_path = item['path']
 
             if not current_path or not os.path.exists(current_path):
-                # Silent fail for the user on specific file, but log it
                 logger.error(f"[{task_id}] Failed to download item {index}")
                 await send_msg_to_user(client, chat_id, f"Skipped file {index}: Download failed.", is_error=True)
                 continue 
@@ -333,7 +337,7 @@ async def process_task_async(link, chat_id, task_id):
             try:
                 update_task(task_id, "processing", phase="uploading", message=f"Uploading {index}/{total_files}")
                 
-                # FIX: Check if it is an image or video to determine attributes and streaming support
+                # Detect file type for upload attributes
                 is_video_file = current_path.lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv'))
                 
                 if is_video_file:
@@ -355,7 +359,8 @@ async def process_task_async(link, chat_id, task_id):
                     caption=f"📁 **File {index}/{total_files}**",
                     attributes=attrs,
                     supports_streaming=use_streaming,
-                    progress_callback=upload_progress
+                    progress_callback=upload_progress,
+                    force_document=False # Allow Telegram to decide (Photo vs Document) or set True to force File mode
                 )
             except Exception as e:
                 logger.error(f"[{task_id}] Upload Fail: {e}")
